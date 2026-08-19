@@ -8,6 +8,8 @@ wheels/
 web_dist
 # Virtual environments
 .venv
+.tools/
+.run/
 .idea
 data
 config.json

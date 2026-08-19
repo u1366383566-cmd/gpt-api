@@ -691,6 +691,10 @@ class OpenAIBackendAPI:
         }
         response_headers = dict(headers.items()) if hasattr(headers, "items") else dict(headers or {})
         tool = ((payload.get("tools") or [{}])[0]) if isinstance(payload.get("tools"), list) else {}
+        input_value = payload.get("input")
+        first_input = input_value[0] if isinstance(input_value, list) and input_value else {}
+        first_content = first_input.get("content") if isinstance(first_input, dict) else []
+        first_content = first_content if isinstance(first_content, list) else []
         logger.warning({
             "event": "codex_responses_http_error",
             "path": path,
@@ -701,9 +705,9 @@ class OpenAIBackendAPI:
                 "tool_action": tool.get("action"),
                 "size": tool.get("size"),
                 "quality": tool.get("quality"),
-                "image_input_count": max(len((payload.get("input") or [{}])[0].get("content") or []) - 1, 0),
+                "image_input_count": max(len(first_content) - 1, 0),
                 "prompt_preview": self._codex_body_preview(
-                    (((payload.get("input") or [{}])[0].get("content") or [{}])[0].get("text") or ""),
+                    ((first_content[0].get("text") or "") if first_content and isinstance(first_content[0], dict) else ""),
                     500,
                 ),
                 "headers": safe_request_headers,
@@ -771,6 +775,90 @@ class OpenAIBackendAPI:
         })
         for event in events:
             yield event
+
+    @staticmethod
+    def _iter_codex_stream_events(raw: Any) -> Iterator[Dict[str, Any]]:
+        """Parse Codex Responses incrementally without buffering the full stream."""
+        content_type = str(raw.headers.get("content-type") or "").lower()
+        if "application/json" in content_type:
+            text = raw.read().decode("utf-8", "replace")
+            try:
+                payload = json.loads(text)
+            except Exception as exc:
+                raise RuntimeError(f"invalid Codex response JSON: {exc}") from exc
+            if isinstance(payload, dict):
+                yield payload
+            return
+
+        data_lines: list[str] = []
+
+        def flush() -> Dict[str, Any] | None:
+            if not data_lines:
+                return None
+            payload_text = "\n".join(data_lines).strip()
+            data_lines.clear()
+            if not payload_text or payload_text == "[DONE]":
+                return None
+            try:
+                payload = json.loads(payload_text)
+            except Exception as exc:
+                logger.warning({
+                    "event": "codex_responses_sse_parse_error",
+                    "error_type": type(exc).__name__,
+                })
+                return None
+            return payload if isinstance(payload, dict) else None
+
+        for raw_line in raw:
+            line = raw_line.decode("utf-8", "replace") if isinstance(raw_line, bytes) else str(raw_line)
+            line = line.rstrip("\r\n")
+            if not line:
+                payload = flush()
+                if payload is not None:
+                    yield payload
+                continue
+            if line.startswith("data:"):
+                data_lines.append(line[5:].lstrip())
+            # SSE event/id/retry fields are metadata; the JSON data is enough.
+        payload = flush()
+        if payload is not None:
+            yield payload
+
+    def iter_codex_response_events(self, payload: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
+        """Send a generic text/tool request to the native Codex Responses API."""
+        if not self.access_token:
+            raise RuntimeError("access_token is required for Codex Responses")
+        self._ensure_codex_source_account()
+        request_payload = dict(payload)
+        request_payload["stream"] = True
+        request_payload.setdefault("store", False)
+        path = "/backend-api/codex/responses"
+        request = urllib.request.Request(
+            self.base_url + path,
+            json.dumps(request_payload, ensure_ascii=False).encode("utf-8"),
+            self._codex_responses_headers(),
+            method="POST",
+        )
+        logger.info({
+            "event": "codex_text_responses_request",
+            "model": request_payload.get("model"),
+            "stream": True,
+            "tool_count": len(request_payload.get("tools") or []) if isinstance(request_payload.get("tools"), list) else 0,
+        })
+        try:
+            with urllib.request.urlopen(request, timeout=1200) as raw:
+                yield from self._iter_codex_stream_events(raw)
+        except urllib.error.HTTPError as error:
+            body_text = error.read().decode("utf-8", "replace")
+            body: Any = body_text
+            try:
+                body = json.loads(body_text)
+            except Exception:
+                pass
+            self._log_codex_response_failure(path, error.code, error.headers, request_payload, body)
+            retry_after_header = error.headers.get("Retry-After") if error.headers else None
+            retry_after = int(retry_after_header) if str(retry_after_header or "").isdigit() else None
+            raise UpstreamHTTPError(path, error.code, body, retry_after=retry_after) from error
 
     def iter_codex_image_response_events(
             self,

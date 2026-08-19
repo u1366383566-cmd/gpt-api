@@ -77,6 +77,9 @@ uv sync
 uv run main.py
 ```
 
+本地后端默认监听 `http://127.0.0.1:8021`。可通过 `CHATGPT2API_LOCAL_HOST` 和
+`CHATGPT2API_LOCAL_PORT` 覆盖；前端开发环境可通过 `NEXT_PUBLIC_API_URL` 指向其他后端地址。
+
 启动前端：
 
 ```bash

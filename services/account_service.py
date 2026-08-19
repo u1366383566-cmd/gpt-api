@@ -1001,6 +1001,7 @@ class AccountService:
             self,
             excluded_tokens: set[str] | None = None,
             model: str = "auto",
+            source_type: str | None = None,
     ) -> str:
         excluded = set(excluded_tokens or set())
         requested_model = str(model or "auto").strip() or "auto"
@@ -1014,6 +1015,7 @@ class AccountService:
                 token
                 for account in self._accounts.values()
                 if account.get("status") not in {"禁用", "异常"}
+                   and self._account_matches_source_type(account, source_type)
                    and (
                        route is None
                        or self._normalize_account_type(account.get("type")) in route.account_types
@@ -1023,6 +1025,12 @@ class AccountService:
             ]
             if not candidates:
                 if route is None or route.allow_anonymous:
+                    if source_type:
+                        from services.model_service import ModelUnavailableError
+
+                        raise ModelUnavailableError(
+                            f"no available {self._normalize_source_type(source_type)} source account"
+                        )
                     return ""
                 from services.model_service import ModelUnavailableError
 
@@ -1032,6 +1040,17 @@ class AccountService:
             access_token = candidates[self._index % len(candidates)]
             self._index += 1
         return self.refresh_access_token(access_token, event="get_text_access_token") or access_token
+
+    def get_codex_access_token(
+            self,
+            excluded_tokens: set[str] | None = None,
+    ) -> str:
+        """Return an active account explicitly imported for Codex requests."""
+        return self.get_text_access_token(
+            excluded_tokens=excluded_tokens,
+            model="auto",
+            source_type="codex",
+        )
 
     def mark_text_used(self, access_token: str) -> None:
         if not access_token:

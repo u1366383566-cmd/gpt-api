@@ -6,6 +6,10 @@ from typing import Any, Iterable, Iterator
 
 from fastapi import HTTPException
 
+from services.account_service import account_service
+from services.codex_protocol import is_native_codex_request, normalize_codex_model
+from services.model_service import ModelUnavailableError
+from services.openai_backend_api import OpenAIBackendAPI
 from services.protocol.chat_completion_cache import cache_key, chat_completion_cache, normalize_text_messages
 from services.protocol.conversation import (
     ConversationRequest,
@@ -400,17 +404,47 @@ def stream_image_response(
     raise RuntimeError("image generation failed")
 
 
+def stream_native_codex_response(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    """Relay a tool-capable Responses request to the native Codex endpoint."""
+    requested_model = str(body.get("model") or "gpt-5-5").strip() or "gpt-5-5"
+    payload = dict(body)
+    payload["model"] = normalize_codex_model(requested_model)
+    payload["stream"] = True
+    payload.setdefault("store", False)
+    try:
+        access_token = account_service.get_codex_access_token()
+    except ModelUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"error": {"message": str(exc), "type": "codex_unavailable", "code": "no_codex_account"}},
+        ) from exc
+    backend = OpenAIBackendAPI(access_token=access_token)
+    try:
+        yield from backend.iter_codex_response_events(payload)
+    finally:
+        backend.close()
+
+
 def collect_response(events: Iterable[dict[str, Any]]) -> dict[str, Any]:
     completed = {}
     for event in events:
         if event.get("type") == "response.completed":
             completed = event.get("response") if isinstance(event.get("response"), dict) else {}
+        elif event.get("object") == "response":
+            completed = event
+        elif event.get("type") == "response.failed":
+            error = event.get("error") or (event.get("response") or {}).get("error")
+            raise RuntimeError(str(error or "Codex response failed"))
     if not completed:
         raise RuntimeError("response generation failed")
     return completed
 
 
 def response_events(body: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    if is_native_codex_request(body):
+        yield from stream_native_codex_response(body)
+        return
+
     if is_text_response_request(body):
         model, messages = text_response_parts(body)
         if has_web_search_tool(body) and not has_unsupported_response_tools(body):
