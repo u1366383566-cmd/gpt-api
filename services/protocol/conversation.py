@@ -5,7 +5,7 @@ import json
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Iterator
 
@@ -217,9 +217,10 @@ def assistant_history_messages(messages: list[dict[str, Any]]) -> list[str]:
 def build_image_prompt(prompt: str, size: str | None, quality: str = "auto") -> str:
     hints = []
     if size:
-        hints.append(f"输出图片尺寸为 {size}。")
-    if quality:
-        hints.append(f"输出图片质量为 {quality}。")
+        hints.append(f"Output image size: {size}.")
+    # quality=auto 是"交由上游自选"，写进提示词只会成为字面执行的噪声；仅在显式指定时提示。
+    if quality and str(quality).strip().lower() not in {"auto", ""}:
+        hints.append(f"Target quality: {quality}.")
     return f"{prompt.strip()}\n\n{''.join(hints)}" if hints else prompt
 
 
@@ -299,6 +300,8 @@ class ConversationRequest:
     prompt: str = ""
     messages: list[dict[str, Any]] | None = None
     thinking_effort: str = ""
+    # NATURAL-PIPELINE-20261020: 以图生图管线（fast|natural）；空 = 快速通道（兼容旧调用方）
+    image_pipeline: str = ""
     images: list[str] | None = None
     n: int = 1
     size: str | None = None
@@ -307,6 +310,9 @@ class ConversationRequest:
     base_url: str | None = None
     message_as_error: bool = False
     progress_callback: Any = None  # Callable[[str], None] | None
+    # 观测用：非空时，生图流结束后把上游管线元数据（model_slug / skipped_mainline /
+    # 工具 prompt 等，见 _collect_upstream_image_meta）写入该 dict，供任务记录采集。
+    meta_sink: dict[str, Any] | None = None
 
 
 @dataclass
@@ -689,6 +695,7 @@ def conversation_events(
     size: str | None = None,
     quality: str = "auto",
     thinking_effort: str = "",
+    image_pipeline: str = "",
 ) -> Iterator[dict[str, Any]]:
     normalized = normalize_messages(messages or ([{"role": "user", "content": prompt}] if prompt else []))
     image_model = is_supported_image_model(model)
@@ -702,6 +709,7 @@ def conversation_events(
         images=images if image_model else None,
         system_hints=["picture_v2"] if image_model else None,
         thinking_effort=thinking_effort if not image_model else "",
+        image_pipeline=image_pipeline,
     )
     yield from iter_conversation_payloads(payloads, history_text, history_messages)
 
@@ -835,6 +843,154 @@ def _remove_image_conversation_later(
     threading.Thread(target=_run, name=f"remove-image-conversation-{conversation_id}", daemon=True).start()
 
 
+_META_TEXT_LIMIT = 200
+
+_META_STE_KEYS = (
+    "model_slug",
+    "resolved_model_slug",
+    "turn_use_case",
+    "plan_type",
+    "requested_model_experience",
+)
+
+
+def _collect_upstream_image_meta(raw: Any, sink: dict[str, Any]) -> None:
+    """从生图 SSE 事件提取上游管线元数据（观测白名单字段，写入 sink）。
+
+    关键观测点：picture_v2 快速通道上游返回 server_ste_metadata 与
+    skipped_mainline 标记，用于量化"主线模型是否参与本次生图"。
+    """
+    if not isinstance(raw, dict) or not isinstance(sink, dict):
+        return
+    if raw.get("type") == "server_ste_metadata":
+        meta = raw.get("metadata")
+        if isinstance(meta, dict):
+            for key in _META_STE_KEYS:
+                value = meta.get(key)
+                if value and key not in sink:
+                    sink[key] = str(value)
+    message = raw.get("message")
+    if not isinstance(message, dict):
+        return
+    message_meta = message.get("metadata")
+    if isinstance(message_meta, dict):
+        resolved = message_meta.get("resolved_model_slug")
+        if resolved and "resolved_model_slug" not in sink:
+            sink["resolved_model_slug"] = str(resolved)
+    content = message.get("content")
+    if not isinstance(content, dict):
+        return
+    parts = content.get("parts")
+    text = "".join(str(part) for part in parts if isinstance(part, str)) if isinstance(parts, list) else str(content.get("text") or "")
+    if "skipped_mainline" not in sink and "skipped_mainline" in text:
+        sink["skipped_mainline"] = True
+    if not isinstance(parts, list):
+        return
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        part_meta = part.get("metadata")
+        if not isinstance(part_meta, dict):
+            continue
+        dalle = part_meta.get("dalle")
+        if isinstance(dalle, dict):
+            if "tool_prompt" not in sink:
+                sink["tool_prompt"] = str(dalle.get("prompt") or "")[:_META_TEXT_LIMIT]
+            if dalle.get("edit_op") is not None and "edit_op" not in sink:
+                sink["edit_op"] = str(dalle.get("edit_op"))
+        generation = part_meta.get("generation")
+        if isinstance(generation, dict) and "gen_size" not in sink:
+            sink["gen_size"] = str(generation.get("gen_size") or "")
+
+
+IMAGE_EDIT_ENHANCE_SYSTEM_PROMPT = (
+    "You are a prompt engineer for an image editing model. The user supplies reference image(s) "
+    "and an editing instruction, possibly written in Chinese. Rewrite the request as ONE detailed "
+    "English generation instruction that describes the FINAL image: state explicitly which visual "
+    "features of each reference image must be preserved (structure, proportions, layout, shapes, "
+    "style, materials, colors) and exactly what must change. If multiple images are provided, "
+    "refer to them as 'the first image' / 'the second image'. Never ask questions, never offer "
+    "options. Output only the final instruction text."
+)
+
+
+_ENHANCE_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="img-enhance")
+
+
+def _enhance_prompt_core(images: list[tuple[bytes, str, str]], original: str, upstream_model: str) -> str:
+    """转写的网络部分：取号 + 看图会话。返回转写结果（可能为空串）；异常向上抛。"""
+    token = account_service.get_text_access_token(model=upstream_model)
+    if not token:
+        return ""
+    content: list[dict[str, Any]] = [{"type": "text", "text": original}]
+    for data, _filename, mime in images:
+        if data:
+            content.append({"type": "image", "data": bytes(data), "mime": mime or "image/png"})
+    messages = [
+        {"role": "system", "content": IMAGE_EDIT_ENHANCE_SYSTEM_PROMPT},
+        {"role": "user", "content": content},
+    ]
+    backend = OpenAIBackendAPI(access_token=token)
+    try:
+        return collect_text(backend, ConversationRequest(
+            messages=messages,
+            model=upstream_model,
+        )).strip()
+    finally:
+        backend.close()
+
+
+def enhance_prompt_for_edit(images: list[tuple[bytes, str, str]], prompt: str, model: str = "") -> str:
+    """以图生图前置转写：让文本模型看参考图，把用户指令重写为详细英文生成指令。
+
+    picture_v2 快速通道上游会 skipped_mainline（跳过主线模型），提示词被字面执行、
+    参考图得不到语义消化；本函数在反代侧补上"看图理解"环节。任何失败都回退原始
+    prompt，绝不阻塞生图主链路——包括超时：整个转写（取号+会话）受
+    image_prompt_enhance_budget_secs 墙钟预算约束，到点回退原始 prompt；残留的
+    worker 线程由 text_stream_timeout_secs 流硬上限保证最终退出。
+    """
+    original = (prompt or "").strip()
+    try:
+        if not original or not images:
+            return prompt
+        upstream_model = (model or config.image_prompt_enhance_model or config.default_upstream_model_name).strip()
+        future = _ENHANCE_EXECUTOR.submit(_enhance_prompt_core, images, original, upstream_model)
+        try:
+            enhanced = future.result(timeout=float(config.image_prompt_enhance_budget_secs))
+        except FuturesTimeoutError:
+            future.cancel()
+            logger.warning({
+                "event": "image_edit_prompt_enhance_timeout",
+                "model": upstream_model,
+                "budget_secs": config.image_prompt_enhance_budget_secs,
+            })
+            return prompt
+        if not enhanced:
+            return prompt
+        # 过短或疑似模型反问（而非给出指令）时回退原始 prompt
+        if len(enhanced) >= 40 and not enhanced.rstrip().endswith(("?", "？")):
+            logger.info({
+                "event": "image_edit_prompt_enhanced",
+                "model": upstream_model,
+                "original_len": len(original),
+                "enhanced_len": len(enhanced),
+                "preview": enhanced[:160],
+            })
+            return enhanced
+        logger.warning({
+            "event": "image_edit_prompt_enhance_rejected",
+            "model": upstream_model,
+            "preview": enhanced[:160],
+        })
+        return prompt
+    except Exception as exc:
+        logger.warning({
+            "event": "image_edit_prompt_enhance_failed",
+            "error": repr(exc)[:240],
+        })
+        return prompt
+
+
 def stream_image_outputs(
         backend: OpenAIBackendAPI,
         request: ConversationRequest,
@@ -842,6 +998,7 @@ def stream_image_outputs(
         total: int = 1,
 ) -> Iterator[ImageOutput]:
     last: dict[str, Any] = {}
+    upstream_meta: dict[str, Any] = {}
     for event in conversation_events(
             backend,
             prompt=request.prompt,
@@ -849,8 +1006,10 @@ def stream_image_outputs(
             images=request.images or [],
             size=request.size,
             quality=request.quality,
+            image_pipeline=getattr(request, "image_pipeline", "") or "",
     ):
         last = event
+        _collect_upstream_image_meta(event.get("raw"), upstream_meta)
         if event.get("type") == "conversation.delta":
             yield ImageOutput(
                 kind="progress",
@@ -878,6 +1037,11 @@ def stream_image_outputs(
     file_ids = [str(item) for item in last.get("file_ids") or []]
     sediment_ids = [str(item) for item in last.get("sediment_ids") or []]
     message = str(last.get("text") or "").strip()
+    if request.meta_sink is not None:
+        request.meta_sink.clear()
+        request.meta_sink.update(upstream_meta)
+    if upstream_meta:
+        logger.info({"event": "image_upstream_meta", **upstream_meta})
     logger.info({
         "event": "image_stream_resolve_start",
         "conversation_id": conversation_id,

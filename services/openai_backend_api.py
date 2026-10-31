@@ -556,15 +556,19 @@ class OpenAIBackendAPI:
                 "screen_width": 2560,
             },
         }
-        normalized_effort = self._normalize_thinking_effort(thinking_effort or config.default_thinking_effort)
-        if normalized_effort:
-            payload["thinking_effort"] = normalized_effort
+        # 2026-09-09: free-plan accounts get 422 from /backend-api/conversation whenever
+        # thinking_effort is present (low/medium/high all rejected, empty body). The pool
+        # is all-free today, so never attach it; revisit when a paid account joins.
+        # See wiki gpt2api-pool; reported by Cursor agent requests (reasoning_effort=high).
         return payload
 
-    def _image_model_settings(self, model: str) -> tuple[str, str]:
+    def _image_model_settings(self, model: str, pipeline: str = "") -> tuple[str, str]:
         """把标准图片模型名映射为上游模型及思考强度。"""
         _, base_model = split_image_model(model)
         if not base_model:
+            return "auto", ""
+        # NATURAL-PIPELINE-20261020: 官网对齐——model 交上游 auto 路由（gpt-6 家族主线参与）
+        if pipeline == "natural" and base_model == "gpt-image-2":
             return "auto", ""
         if base_model == "gpt-image-2":
             upstream_model = config.default_upstream_model_name
@@ -949,10 +953,11 @@ class OpenAIBackendAPI:
             retry_after = int(retry_after_header) if str(retry_after_header or "").isdigit() else None
             raise UpstreamHTTPError(path, error.code, body, retry_after=retry_after) from error
 
-    def _prepare_image_conversation(self, prompt: str, requirements: ChatRequirements, model: str) -> str:
+    def _prepare_image_conversation(self, prompt: str, requirements: ChatRequirements, model: str,
+                                    pipeline: str = "") -> str:
         """为图片生成准备 conduit token。"""
         path = "/backend-api/f/conversation/prepare"
-        upstream_model, thinking_effort = self._image_model_settings(model)
+        upstream_model, thinking_effort = self._image_model_settings(model, pipeline)
         payload = {
             "action": "next",
             "fork_from_shared_post": False,
@@ -962,7 +967,7 @@ class OpenAIBackendAPI:
             "timezone_offset_min": -480,
             "timezone": "Asia/Shanghai",
             "conversation_mode": {"kind": "primary_assistant"},
-            "system_hints": ["picture_v2"],
+            **({} if pipeline == "natural" else {"system_hints": ["picture_v2"]}),  # NATURAL-PIPELINE-20261020
             "partial_query": {
                 "id": new_uuid(),
                 "author": {"role": "user"},
@@ -1058,9 +1063,10 @@ class OpenAIBackendAPI:
         }
 
     def _start_image_generation(self, prompt: str, requirements: ChatRequirements, conduit_token: str, model: str,
-                                references: Optional[list[Dict[str, Any]]] = None) -> requests.Response:
+                                references: Optional[list[Dict[str, Any]]] = None,
+                                pipeline: str = "") -> requests.Response:
         """启动图片生成或编辑的 SSE 请求。"""
-        upstream_model, thinking_effort = self._image_model_settings(model)
+        upstream_model, thinking_effort = self._image_model_settings(model, pipeline)
         references = references or []
         parts = [{
             "content_type": "image_asset_pointer",
@@ -1076,7 +1082,7 @@ class OpenAIBackendAPI:
             "developer_mode_connector_ids": [],
             "selected_github_repos": [],
             "selected_all_github_repos": False,
-            "system_hints": ["picture_v2"],
+            **({} if pipeline == "natural" else {"system_hints": ["picture_v2"]}),  # NATURAL-PIPELINE-20261020
             "serialization_metadata": {"custom_symbol_offsets": []},
         }
         if references:
@@ -1104,7 +1110,7 @@ class OpenAIBackendAPI:
             "timezone": "Asia/Shanghai",
             "conversation_mode": {"kind": "primary_assistant"},
             "enable_message_followups": True,
-            "system_hints": ["picture_v2"],
+            **({} if pipeline == "natural" else {"system_hints": ["picture_v2"]}),  # NATURAL-PIPELINE-20261020
             "supports_buffering": True,
             "supported_encodings": ["v1"],
             "client_contextual_info": {
@@ -2651,10 +2657,11 @@ class OpenAIBackendAPI:
             images: Optional[list[str]] = None,
             system_hints: Optional[list[str]] = None,
             thinking_effort: str = "",
+            image_pipeline: str = "",
     ) -> Iterator[str]:
         system_hints = system_hints or []
         if "picture_v2" in system_hints:
-            yield from self._stream_picture_conversation(prompt, model, images or [])
+            yield from self._stream_picture_conversation(prompt, model, images or [], image_pipeline)
             return
 
         normalized = messages or [{"role": "user", "content": prompt}]
@@ -2670,10 +2677,10 @@ class OpenAIBackendAPI:
             stream=True,
         )
         ensure_ok(response, path)
-        try:
-            yield from iter_sse_payloads(response)
-        finally:
-            response.close()
+        # 文本 SSE 与图片管线同理：curl_cffi 标量 timeout 不限流式总读取时长，
+        # 上游停滞时裸 iter_sse_payloads 会无限阻塞（enhance 前置转写挂死根因）。
+        yield from self._iter_sse_payloads_capped(
+            response, float(config.text_stream_timeout_secs))
 
     def _report_progress(self, step: str) -> None:
         """Report progress step to the callback if set."""
@@ -2688,6 +2695,7 @@ class OpenAIBackendAPI:
             prompt: str,
             model: str,
             images: list[str],
+            pipeline: str = "",
     ) -> Iterator[str]:
         if not self.access_token:
             raise RuntimeError("access_token is required for image endpoints")
@@ -2698,9 +2706,9 @@ class OpenAIBackendAPI:
         self._report_progress("getting_token")
         requirements = self._get_chat_requirements()
         self._report_progress("preparing_conversation")
-        conduit_token = self._prepare_image_conversation(prompt, requirements, model)
+        conduit_token = self._prepare_image_conversation(prompt, requirements, model, pipeline)
         self._report_progress("starting_generation")
-        response = self._start_image_generation(prompt, requirements, conduit_token, model, references)
+        response = self._start_image_generation(prompt, requirements, conduit_token, model, references, pipeline)
         self._report_progress("generating")
         yield from self._iter_sse_payloads_capped(response, float(config.image_poll_timeout_secs))
 
@@ -2742,7 +2750,7 @@ class OpenAIBackendAPI:
         response = self.session.get(
             self.base_url + "/",
             headers=self._bootstrap_headers(),
-            timeout=30,
+            timeout=10,
         )
         ensure_ok(response, "bootstrap")
         self.pow_script_sources, self.pow_data_build = parse_pow_resources(response.text)
@@ -2826,7 +2834,7 @@ class OpenAIBackendAPI:
         response = self.session.get(
             self.base_url + path,
             headers=self._headers(route),
-            timeout=30,
+            timeout=10,
         )
         ensure_ok(response, context)
         data = []
