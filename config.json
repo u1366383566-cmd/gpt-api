@@ -11,11 +11,11 @@
     "info",
     "warning"
   ],
-  "proxy": "",
+  "proxy": "socks5://127.0.0.1:7897",
   "proxy_runtime": {
     "enabled": true,
-    "egress_mode": "direct",
-    "proxy_url": "",
+    "egress_mode": "single_proxy",
+    "proxy_url": "socks5://127.0.0.1:7897",
     "resource_proxy_url": "",
     "skip_ssl_verify": false,
     "reset_session_status_codes": [
