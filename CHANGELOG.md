@@ -2,6 +2,15 @@
 
 ## Unreleased
 
++ [新增] `/v1/images/edits` 支持 `image_edit_pipeline` 管线选择：`natural`（官网对齐，主线上参与）、`auto`（默认，natural 失败自动回退快速通道）、`fast`（原行为）；配套以图生图前置转写（文本模型先看参考图重写指令，带超时预算兜底）与上游管线元数据观测（`_upstream_meta`）。
++ [新增] `GET /api/quota` 脱敏额度汇总端点（任意有效密钥可查，便于外部守护自动补号）。
++ [新增] 取号调度策略 `account_dispatch_strategy`（轮询/随机，运行时可切）。
++ [修复] 图片基准地址支持 `x-forwarded-prefix` 反代前缀；空号池返回 503 而非 429。
++ [修复] 账号导入剥离 `proxy`/`proxy_used` 字段，注册专用代理不再被静默导入。
++ [修复] 账号远端复核对瞬时错误重试一次，并在池耗尽时带出最后一个校验错误。
++ [修复] 模型目录 stale-while-revalidate，后台单飞刷新，`/v1/models` 不再被上游劣化拖死。
++ [修复] 文本 SSE 读取加 `text_stream_timeout_secs` 硬上限；bootstrap/模型请求超时 30s→10s；free 号不再附带 `thinking_effort`（422）。
+
 ## 1.8.0 - 2026-07-28
 
 + [新增] 新增默认请求上游模型名称和默认思考强度配置，支持在设置页面修改，并可通过模型名的 `-standard`、`-extended`、`-max` 后缀覆盖思考强度。
