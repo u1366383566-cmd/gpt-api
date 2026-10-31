@@ -209,6 +209,28 @@ def sse_json_stream(items) -> Iterator[str]:
     yield "data: [DONE]\n\n"
 
 
+def responses_sse_stream(items) -> Iterator[str]:
+    """OpenAI Responses API 兼容 SSE:每个事件带 event: 字段(与官方格式一致)。"""
+    try:
+        for item in items:
+            if isinstance(item, dict):
+                event_type = str(item.get("type") or "").strip()
+                if event_type:
+                    yield f"event: {event_type}\n"
+            yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+    except Exception as exc:
+        logger.warning({
+            "event": "responses_sse_stream_error",
+            "error_type": exc.__class__.__name__,
+            "error": str(exc),
+        })
+        error = exc.to_openai_error() if hasattr(exc, "to_openai_error") else {
+            "error": {"message": str(exc), "type": exc.__class__.__name__}
+        }
+        yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n"
+    yield "data: [DONE]\n\n"
+
+
 def anthropic_sse_stream(items) -> Iterator[str]:
     try:
         for item in items:

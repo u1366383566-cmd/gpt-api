@@ -150,7 +150,7 @@ def create_router() -> APIRouter:
             request_shape=request_shape(payload.get("input")),
         )
         await filter_or_log(call, request_preview)
-        return await call.run(openai_v1_response.handle, payload)
+        return await call.run(openai_v1_response.handle, payload, sse="responses")
 
     @router.post("/v1/messages")
     async def create_message(
