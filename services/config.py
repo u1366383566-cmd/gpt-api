@@ -423,6 +423,56 @@ class ConfigStore:
             return 3
 
     @property
+    def account_dispatch_strategy(self) -> str:
+        """取号调度策略：round_robin（轮询，默认）| random（随机）。运行时可在设置页/API 切换。"""
+        value = str(self.data.get("account_dispatch_strategy", "round_robin") or "").strip().lower()
+        return value if value in {"round_robin", "random"} else "round_robin"
+
+    @property
+    def image_prompt_enhance_enabled(self) -> bool:
+        """以图生图前置转写：先让文本模型看参考图、把用户指令重写为详细英文生成指令，再走快速生图通道。
+
+        背景：picture_v2 快速通道上游会 skipped_mainline（跳过主线模型），提示词被字面执行，
+        参考图得不到语义消化；该转写在反代侧补上"看图理解"环节。"""
+        return _normalize_bool(self.data.get("image_prompt_enhance_enabled"), True)
+
+    @property
+    def image_prompt_enhance_model(self) -> str:
+        """前置转写使用的文本模型；空 = 沿用 default_upstream_model_name。"""
+        return str(self.data.get("image_prompt_enhance_model") or "").strip()
+
+    @property
+    def image_edit_pipeline(self) -> str:
+        """以图生图管线选择（/v1/images/edits）。
+
+        fast = picture_v2 快速通道（09-23 起行为，跳过主线模型）；
+        natural = 官网对齐：不带 system_hints、model 交上游 auto 路由（主线参与，
+        2026-10-20 A/B 实验证实结构保真显著更优且仅 +3s）；
+        auto（默认）= 先 natural，失败回退 fast+前置转写，再回退 fast+原始 prompt。
+        """
+        value = str(self.data.get("image_edit_pipeline", "auto") or "auto").strip().lower()
+        return value if value in {"fast", "natural", "auto"} else "auto"
+
+    @property
+    def text_stream_timeout_secs(self) -> int:
+        """单条文本 SSE 流的总读取墙钟硬上限（秒）。
+
+        curl_cffi 在 stream=True + 标量 timeout 下不限制流式 body 的总读取时长，
+        上游停滞时读取会无限阻塞；到点强制关连接并报错（与图片管线同策略）。"""
+        try:
+            return max(1, int(self.data.get("text_stream_timeout_secs", 240)))
+        except (TypeError, ValueError):
+            return 240
+
+    @property
+    def image_prompt_enhance_budget_secs(self) -> int:
+        """前置转写整体预算（秒）：取号+看图会话合计超过即回退原始 prompt，不阻塞生图。"""
+        try:
+            return max(1, int(self.data.get("image_prompt_enhance_budget_secs", 240)))
+        except (TypeError, ValueError):
+            return 240
+
+    @property
     def image_parallel_generation(self) -> bool:
         value = self.data.get("image_parallel_generation", True)
         if isinstance(value, str):
@@ -580,6 +630,11 @@ class ConfigStore:
         data["global_system_prompt"] = self.global_system_prompt
         data["default_upstream_model_name"] = self.default_upstream_model_name
         data["default_thinking_effort"] = self.default_thinking_effort
+        data["image_prompt_enhance_enabled"] = self.image_prompt_enhance_enabled
+        data["image_prompt_enhance_model"] = self.image_prompt_enhance_model
+        data["image_edit_pipeline"] = self.image_edit_pipeline
+        data["text_stream_timeout_secs"] = self.text_stream_timeout_secs
+        data["image_prompt_enhance_budget_secs"] = self.image_prompt_enhance_budget_secs
         data["backup"] = self.get_backup_settings()
         data["image_storage"] = self.get_image_storage_settings()
         data["chat_completion_cache"] = self.get_chat_completion_cache_settings()

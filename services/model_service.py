@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from threading import RLock
 from typing import Any
@@ -42,6 +42,9 @@ class ModelCatalogService:
         self._account_signature: tuple[tuple[str, int], ...] = ()
         self._anonymous_models: dict[str, dict[str, Any]] = {}
         self._models_by_account_type: dict[str, dict[str, dict[str, Any]]] = {}
+        self._has_cache = False
+        self._refresh_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="model-catalog")
+        self._refresh_future: Any = None
 
     @staticmethod
     def _model_map(result: object) -> dict[str, dict[str, Any]]:
@@ -88,7 +91,8 @@ class ModelCatalogService:
     ) -> dict[str, dict[str, Any]] | None:
         attempted_tokens: set[str] = set()
         last_error: Exception | None = None
-        for access_token in access_tokens:
+        # 目录刷新是后台例行公事：只试首个 token，失败留给下轮 TTL，不做串行重试
+        for access_token in access_tokens[:1]:
             try:
                 resolved_token = self._accounts.refresh_access_token(
                     access_token,
@@ -136,10 +140,20 @@ class ModelCatalogService:
                 elif account_type in self._models_by_account_type:
                     models_by_account_type[account_type] = self._models_by_account_type[account_type]
 
-        self._anonymous_models = anonymous_models
-        self._models_by_account_type = models_by_account_type
-        self._account_signature = signature
-        self._expires_at = self._clock() + self._cache_ttl_seconds
+        with self._lock:
+            self._anonymous_models = anonymous_models
+            self._models_by_account_type = models_by_account_type
+            self._account_signature = signature
+            self._expires_at = self._clock() + self._cache_ttl_seconds
+            self._has_cache = True
+
+    _FIRST_WAIT_SECS = 20.0
+
+    def _refresh_job(self, groups: dict[str, list[str]], signature: tuple[tuple[str, int], ...]) -> None:
+        try:
+            self._refresh(groups, signature)
+        except Exception as exc:  # noqa: BLE001 - 后台刷新失败保留旧缓存，等待下轮
+            logger.warning({"event": "model_catalog_refresh_failed", "error_type": type(exc).__name__})
 
     def _ensure_catalog(self) -> None:
         groups = self._active_accounts_by_type()
@@ -147,7 +161,21 @@ class ModelCatalogService:
         with self._lock:
             if signature == self._account_signature and self._clock() < self._expires_at:
                 return
-            self._refresh(groups, signature)
+            future = self._refresh_future
+            if future is None or future.done():
+                future = self._refresh_executor.submit(self._refresh_job, groups, signature)
+                self._refresh_future = future
+        # stale-while-revalidate：有旧缓存立即返回（刷新后台单飞），只有首次
+        # 无缓存才同步等待；同步等待也有总 deadline，避免把 /v1/models 调用方
+        # 拖到网关超时（上游劣化时曾把整条 threadpool 堵死）。
+        if self._has_cache:
+            return
+        try:
+            future.result(timeout=self._FIRST_WAIT_SECS)
+        except FuturesTimeoutError:
+            logger.warning({"event": "model_catalog_first_refresh_timeout", "wait_secs": self._FIRST_WAIT_SECS})
+        except Exception:
+            pass  # _refresh_job 已记录原因
 
     def list_models(self) -> dict[str, Any]:
         self._ensure_catalog()

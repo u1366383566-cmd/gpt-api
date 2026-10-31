@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import random
 import secrets
 import time
 import uuid
@@ -919,6 +920,20 @@ class AccountService:
             if int(self._image_inflight.get(token, 0)) < max_concurrency
         ]
 
+    def _pick_candidate(self, candidates: list[str]) -> str:
+        """按调度策略从候选 token 中选一个；调用方必须已持有对应锁。
+
+        round_robin（默认）：全局序号轮询，均摊用量；
+        random：每次随机挑一个。由设置 account_dispatch_strategy 运行时切换。
+        """
+        if not candidates:
+            raise ValueError("candidates is required")
+        if config.account_dispatch_strategy == "random" and len(candidates) > 1:
+            return random.choice(candidates)
+        token = candidates[self._index % len(candidates)]
+        self._index += 1
+        return token
+
     def _acquire_next_candidate_token(
             self,
             excluded_tokens: set[str] | None = None,
@@ -935,8 +950,7 @@ class AccountService:
                     )
                 tokens = self._list_available_candidate_tokens(excluded_tokens, plan_type, source_type, plan_types)
                 if tokens:
-                    access_token = tokens[self._index % len(tokens)]
-                    self._index += 1
+                    access_token = self._pick_candidate(tokens)
                     self._image_inflight[access_token] = int(self._image_inflight.get(access_token, 0)) + 1
                     return access_token
                 self._image_slot_condition.wait(timeout=1.0)
@@ -953,6 +967,27 @@ class AccountService:
                 self._image_inflight[access_token] = current_inflight - 1
             self._image_slot_condition.notify_all()
 
+    @staticmethod
+    def _is_transient_image_validation_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return any(marker in message for marker in (
+            "timeout",
+            "timed out",
+            "connection",
+            "ssl",
+            "http 500",
+            "http 502",
+            "http 503",
+            "http 504",
+        ))
+
+    @staticmethod
+    def _format_image_validation_error(exc: Exception, access_token: str) -> str:
+        message = " ".join(str(exc).split()).replace(access_token, "[redacted]")
+        if not message:
+            return type(exc).__name__
+        return f"{type(exc).__name__}: {message[:240]}"
+
     def get_available_access_token(
             self,
             plan_type: str | None = None,
@@ -966,17 +1001,54 @@ class AccountService:
         """
         max_attempts = 20  # 防止无限循环
         attempted_tokens: set[str] = set()
+        last_validation_error: tuple[str, Exception] | None = None
         for _attempt in range(max_attempts):
-            access_token = self._acquire_next_candidate_token(
-                excluded_tokens=attempted_tokens,
-                plan_type=plan_type,
-                source_type=source_type,
-                plan_types=plan_types,
-            )
-            attempted_tokens.add(access_token)
             try:
-                account = self.fetch_remote_info(access_token, "get_available_access_token")
-            except Exception:
+                access_token = self._acquire_next_candidate_token(
+                    excluded_tokens=attempted_tokens,
+                    plan_type=plan_type,
+                    source_type=source_type,
+                    plan_types=plan_types,
+                )
+            except RuntimeError as exc:
+                if last_validation_error is not None:
+                    validation_token, validation_error = last_validation_error
+                    raise RuntimeError(
+                        "image account validation failed: "
+                        f"{self._format_image_validation_error(validation_error, validation_token)}"
+                    ) from validation_error
+                raise exc
+            attempted_tokens.add(access_token)
+            account = None
+            validation_error: Exception | None = None
+            for validation_attempt in range(2):
+                try:
+                    account = self.fetch_remote_info(access_token, "get_available_access_token")
+                    break
+                except Exception as exc:
+                    validation_error = exc
+                    last_validation_error = (access_token, exc)
+                    if (
+                            validation_attempt == 0
+                            and self._is_transient_image_validation_error(exc)
+                    ):
+                        time.sleep(1)
+                        continue
+                    break
+            if account is None:
+                if validation_error is not None:
+                    error_message = self._format_image_validation_error(
+                        validation_error,
+                        access_token,
+                    )
+                    log_service.add(
+                        LOG_TYPE_ACCOUNT,
+                        "图片账号远程复核失败",
+                        {
+                            "token": anonymize_token(access_token),
+                            "error": error_message,
+                        },
+                    )
                 self.release_image_slot(access_token)
                 continue
             # fetch_remote_info 内部可能因 token rotation 导致 access_token 变化，
@@ -1037,8 +1109,7 @@ class AccountService:
                 raise ModelUnavailableError(
                     f"model {requested_model!r} is not available to any active account"
                 )
-            access_token = candidates[self._index % len(candidates)]
-            self._index += 1
+            access_token = self._pick_candidate(candidates)
         return self.refresh_access_token(access_token, event="get_text_access_token") or access_token
 
     def get_codex_access_token(
@@ -1134,6 +1205,9 @@ class AccountService:
             return None
         payload = dict(item)
         payload.pop("accessToken", None)
+        # 注册器旧版导出会把注册专用代理写进 proxy 字段；导入一律剥离代理，不覆盖已有账号代理，代理仅经 /api/accounts/update 显式设置。
+        payload.pop("proxy", None)
+        payload.pop("proxy_used", None)
         payload["access_token"] = access_token
         # CPA/Codex 导出文件里的 `type=codex` 是导出格式，不是号池套餐类型。
         if str(payload.get("type") or "").strip().lower() == "codex":
