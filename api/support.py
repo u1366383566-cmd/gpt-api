@@ -47,11 +47,21 @@ def require_admin(authorization: str | None) -> dict[str, object]:
 
 
 def resolve_image_base_url(request: Request) -> str:
+    forwarded_prefix = str(request.headers.get("x-forwarded-prefix", "")).strip().rstrip("/")
+    if forwarded_prefix:
+        if not forwarded_prefix.startswith("/"):
+            forwarded_prefix = f"/{forwarded_prefix}"
+        forwarded_proto = str(request.headers.get("x-forwarded-proto", "")).split(",", 1)[0].strip()
+        scheme = forwarded_proto or request.url.scheme
+        host = str(request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc).strip()
+        return f"{scheme}://{host}{forwarded_prefix}" if host else forwarded_prefix
     return config.base_url or f"{request.url.scheme}://{request.headers.get('host', request.url.netloc)}"
 
 
 def raise_image_quota_error(exc: Exception) -> None:
     message = str(exc)
+    if "no image accounts in pool" in message.lower():
+        raise HTTPException(status_code=503, detail={"error": "no image accounts in pool"}) from exc
     if "no available image quota" in message.lower():
         raise HTTPException(status_code=429, detail={"error": "no available image quota"}) from exc
     raise HTTPException(status_code=502, detail={"error": message}) from exc

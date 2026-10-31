@@ -18,6 +18,7 @@ from services.auth_service import auth_service
 
 from api.support import (
     require_admin,
+    require_identity,
     sanitize_cpa_pool,
     sanitize_cpa_pools,
     sanitize_sub2api_server,
@@ -211,6 +212,14 @@ def create_router() -> APIRouter:
     async def get_accounts(authorization: str | None = Header(default=None)):
         require_admin(authorization)
         return {"items": account_service.list_accounts()}
+
+    @router.get("/api/quota")
+    async def get_quota(authorization: str | None = Header(default=None)):
+        """脱敏额度汇总：仅返回未禁用账号的 quota 合计，不含任何账号明细。"""
+        require_identity(authorization)
+        accounts = account_service.list_accounts()
+        total = sum(max(0, int(item.get("quota") or 0)) for item in accounts if item.get("status") != "禁用")
+        return {"quota": total}
 
     @router.post("/api/accounts")
     async def create_accounts(body: AccountCreateRequest, authorization: str | None = Header(default=None)):
