@@ -39,6 +39,12 @@
   "global_system_prompt": "",
   "default_upstream_model_name": "gpt-5-5",
   "default_thinking_effort": "auto",
+  "account_dispatch_strategy": "round_robin",
+  "image_prompt_enhance_enabled": true,
+  "image_prompt_enhance_model": "",
+  "image_edit_pipeline": "auto",
+  "text_stream_timeout_secs": 240,
+  "image_prompt_enhance_budget_secs": 240,
   "ai_review": {
     "enabled": false,
     "base_url": "",
